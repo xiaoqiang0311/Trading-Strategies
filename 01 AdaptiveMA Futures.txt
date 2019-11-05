@@ -1,0 +1,319 @@
+
+from jqdata import * 
+import talib 
+from math import isnan
+
+def initialize(context):
+    #set parameters
+    set_parameter(context)
+    #set benchmark
+    set_benchmark('511880.XSHG')
+    #set real_price
+    set_option('use_real_price', True)
+    log.set_level('order', 'error')
+    ### Setup for futures###
+    #Set account to be financial account
+    set_subportfolios([SubPortfolioConfig(cash=context.portfolio.starting_cash, type='futures')])
+    set_order_cost(OrderCost(open_commission=0.00005, close_commission=0.00005,close_today_commission=0.00005), type='index_futures')
+    #set margin ratio
+    set_option('futures_margin_rate', 0.15)
+    #set slippage
+    set_slippage(PriceRelatedSlippage(0.001),type='future')
+    run_daily( before_market_open, time='before_open', reference_security=get_future_code('RB'))
+    run_daily( market_open, time='open', reference_security=get_future_code('RB'))
+    run_daily( after_market_close, time='after_close', reference_security=get_future_code('RB'))
+   
+   #set parameter function
+def set_parameter(context):
+    
+    #######virable setting########
+    g.LastRealPrice = {}
+    g.HighPrice = {} 
+    g.LowPrice = {}
+    g.future_list = [] 
+    g.TradeLots = {} 
+    g.Price_dict = {} 
+    g.Times = {} # calculator
+    g.Reentry_long = False 
+    g.Reentry_short = False
+    g.ATR = {} 
+    g.AMA = {} 
+    g.PriceArray = {} 
+    g.Filter ={} 
+    g.MappingReal = {} 
+    g.MappingIndex = {} 
+    
+    #######Parameters setting ########
+    g.Cross = 0 #MA crosssection
+    g.FilterTimes = 0.3
+    g.NATRstop = 4 #Stop Loss
+    g.Window = 15 
+    
+    #futures trading type
+    g.instruments = ['RU','TA','PP','CU','AG','L','RB','I','J','JD']
+    
+    #price list initialization
+    set_future_list(context)
+
+
+def set_future_list(context):
+    for ins in g.instruments:
+        idx = get_future_code(ins)
+        dom = get_dominant_future(ins)
+        # 填充映射字典
+        g.MappingIndex[ins] = idx
+        g.MappingReal[ins] = dom
+        
+        if dom == '':
+            pass
+        else:
+            if dom not in g.future_list:
+                g.future_list.append(dom)
+                g.HighPrice[dom] = False
+                g.LowPrice[dom] = False
+                g.Times[dom] = 0
+            
+##Function before open
+def before_market_open(context):
+    # output operation time
+    log.info('before_market_open:'+str(context.current_dt.time()))
+    send_message('Begin to trade')
+    
+    #filter the type with no dominant contract, and edit future dictionary information
+    for ins in g.instruments:
+        dom = get_dominant_future(ins)
+        if dom == '':
+            pass
+        else:
+            # judge whether to replace old futures
+            if dom == g.MappingReal[ins]:
+                pass
+            else:
+                replace_old_futures(context,ins,dom)
+                g.future_list.append(dom)
+                g.HighPrice[dom] = False
+                g.LowPrice[dom] = False
+                g.Times[dom] = 0
+        
+            g.TradeLots[dom] = get_lots(context.portfolio.starting_cash/len(g.instruments),ins)
+            
+            
+## Function in market open
+def market_open(context):
+    
+    # main loop
+    for ins in g.instruments:
+        # filter short dominant contract
+        if g.MappingReal[ins] != '':
+            IndexFuture = g.MappingIndex[ins]
+            RealFuture = g.MappingReal[ins]
+            # get current month delivery date
+            end_date = get_CCFX_end_date(RealFuture)
+          
+            if (context.current_dt.date() == end_date):
+                return
+            else:
+                g.LastRealPrice[RealFuture] = attribute_history(RealFuture,1,'1d',['close'])['close'][-1]
+                # 
+                g.PriceArray[IndexFuture] = attribute_history(IndexFuture,50,'1d',['close','open','high','low'])
+                g.CurrentPrice = g.PriceArray[IndexFuture]['close'][-1]
+                g.ClosePrice = g.PriceArray[IndexFuture]['close']
+                # there is no data, return
+                if len(g.PriceArray[IndexFuture]) < 50:
+                    return
+                else:
+                    close = np.array(g.PriceArray[IndexFuture]['close'])
+                    high = np.array(g.PriceArray[IndexFuture]['high'])
+                    low = np.array(g.PriceArray[IndexFuture]['low'])
+                    # Calculate AMA, only input g.Window
+                    g.AMA[IndexFuture] = talib.KAMA(close,g.Window)
+                    # CalculateATR
+                    g.ATR[IndexFuture] = talib.ATR(high,low,close, g.Window)[-1]
+                    if not isnan(g.AMA[IndexFuture][-1]) :
+                        g.Filter[IndexFuture] = talib.STDDEV(g.AMA[IndexFuture][-g.Window:],g.Window)[-1]
+                
+                        #whether AMA two-day difference is bigger than standard deviation filter
+                        if g.AMA[IndexFuture][-1]-g.AMA[IndexFuture][-2] > g.Filter[IndexFuture]*g.FilterTimes:
+                            g.Cross = 1
+                        elif g.AMA[IndexFuture][-2]-g.AMA[IndexFuture][-1] > g.Filter[IndexFuture]*g.FilterTimes:
+                            g.Cross = -1
+                        else:
+                            g.Cross = 0
+        
+                        #judge trading signal, moving average intersection+second time market enter condition
+                        if  g.Cross == 1 and g.Reentry_long == False:
+                            g.Signal = 1
+                        elif g.Cross == -1 and g.Reentry_short == False:
+                            g.Signal = -1
+                        else:
+                            g.Signal = 0
+    
+                    # execute the trade
+                    Trade(context,RealFuture,IndexFuture)
+          
+                    Re_entry(context,RealFuture)
+                    # Calculator+1
+                    if RealFuture in g.Times.keys():
+                        g.Times[RealFuture] += 1 
+                    else:
+                        g.Times[RealFuture] = 0
+            
+           
+## 蔉unction after market
+def after_market_close(context):
+    log.info(str('after_market_close:'+str(context.current_dt.time())))
+    # Get all the trading record in that day
+    trades = get_trades()
+    for _trade in trades.values():
+        log.info('transaction record'+str(_trade))
+    log.info('Over')
+    log.info('##############################################################')
+
+## Trading module
+def Trade(context,RealFuture,IndexFuture):
+    
+    # Short line higher than long line, and tracing stop loss failure, open long
+    if g.Signal == 1 and context.portfolio.long_positions[RealFuture].total_amount == 0:
+        if context.portfolio.long_positions[RealFuture].total_amount != 0:
+            log.info('Short position'%(RealFuture))
+        order_target(RealFuture,0,side='short')
+        order_target(RealFuture,g.TradeLots[RealFuture],side='long')
+        g.HighPrice[RealFuture] = g.LastRealPrice[RealFuture]
+        g.LowPrice[RealFuture] = False
+        log.info('open buy'%(RealFuture))
+        
+    
+    elif g.Signal == -1 and context.portfolio.short_positions[RealFuture].total_amount == 0:
+        if context.portfolio.short_positions[RealFuture].total_amount != 0:
+            log.info('Long position'%(RealFuture))
+        order_target(RealFuture,0,side ='long')
+        order_target(RealFuture,g.TradeLots[RealFuture],side='short')
+        g.LowPrice[RealFuture] = g.LastRealPrice[RealFuture]
+        g.HighPrice[RealFuture] = False
+        log.info('short sell'%(RealFuture))
+    else:
+        # trace stop loss
+        Trailing_Stop(context,RealFuture,IndexFuture)
+
+        
+# avoid reenter after stop loss
+def Re_entry(context,future):
+    #
+    
+    #set highest and lowest price
+    g.Highest_high_2_20 = g.ClosePrice[-21:-1].max()
+    g.Lowest_low_2_20 = g.ClosePrice[-21:-1].min()
+    
+    if  g.Reentry_long == True:
+        if g.Times[future] > 20 or g.CurrentPrice > g.Highest_high_2_20 :
+            g.Reentry_long = False
+    if  g.Reentry_short == True:
+        if g.Times[future] > 20 or g.CurrentPrice < g.Lowest_low_2_20 :
+            g.Reentry_short = False
+        
+# trace stop loss module
+def Trailing_Stop(context,RealFuture,IndexFuture):
+    
+    long_positions = context.portfolio.long_positions
+    short_positions = context.portfolio.short_positions
+
+    if RealFuture in long_positions.keys():
+        if long_positions[RealFuture].total_amount > 0:
+            if g.HighPrice[RealFuture]:
+                g.HighPrice[RealFuture] = max(g.HighPrice[RealFuture], g.LastRealPrice[RealFuture])
+                if g.LastRealPrice[RealFuture]  < g.HighPrice[RealFuture]  - g.NATRstop*g.ATR[IndexFuture]:
+                    log.info('long stop loss' +  RealFuture)
+                    order_target(RealFuture,0,side = 'long')
+                    g.Reentry_long = True
+
+    if RealFuture in short_positions.keys():
+        if short_positions[RealFuture].total_amount > 0:
+            if g.LowPrice[RealFuture]:
+                g.LowPrice[RealFuture] = min(g.LowPrice[RealFuture], g.LastRealPrice[RealFuture])
+                if g.LastRealPrice[RealFuture]  > g.LowPrice[RealFuture] + g.NATRstop*g.ATR[IndexFuture]:
+                    log.info('short stop loss' + RealFuture)
+                    order_target(RealFuture,0,side = 'short')
+                    g.Reentry_short = True
+
+
+# Transfer to new dominant contract       
+def replace_old_futures(context,ins,dom):
+    
+    LastFuture = g.MappingReal[ins]
+    
+    if LastFuture in context.portfolio.long_positions.keys():
+        lots_long = context.portfolio.long_positions[LastFuture].total_amount
+        order_target(LastFuture,0,side='long')
+        order_target(dom,lots_long,side='long')
+        print('Change to new contract, close long position')
+    
+    if LastFuture in context.portfolio.short_positions.keys():
+        lots_short = context.portfolio.short_positions[dom].total_amount
+        order_target(LastFuture,0,side='short')
+        order_target(dom,lots_short,side='short')
+        print('Change to new contract, close short position')
+
+    g.MappingReal[ins] = dom    
+
+
+# Get transaction info
+def get_lots(cash,symbol):
+    future_coef_list = {'A':10, 'AG':15, 'AL':5, 'AU':1000,
+                        'B':10, 'BB':500, 'BU':10, 'C':10, 
+                        'CF':5, 'CS':10, 'CU':5, 'ER':10, 
+                        'FB':500, 'FG':20, 'FU':50, 'GN':10, 
+                        'HC':10, 'I':100, 'IC':200, 'IF':300, 
+                        'IH':300, 'J':100, 'JD':5, 'JM':60, 
+                        'JR':20, 'L':5, 'LR':10, 'M':10, 
+                        'MA':10, 'ME':10, 'NI':1, 'OI':10, 
+                        'P':10, 'PB':5, 'PM':50, 'PP':5, 
+                        'RB':10, 'RI':20, 'RM':10, 'RO':10, 
+                        'RS':10, 'RU':10, 'SF':5, 'SM':5, 
+                        'SN':1, 'SR':10, 'T':10000, 'TA':5, 
+                        'TC':100, 'TF':10000, 'V':5, 'WH':20, 
+                        'WR':10, 'WS':50, 'WT':10, 'Y':10, 
+                        'ZC':100, 'ZN':5}
+    RealFuture = get_dominant_future(symbol)
+    IndexFuture = get_future_code(symbol)
+    # get price list
+    Price_dict = attribute_history(IndexFuture,10,'1d',['open'])
+   
+    if len(Price_dict) == 0: 
+        return
+    else:
+        open_future = Price_dict.iloc[-1]
+    # return numbers
+    if IndexFuture in g.ATR.keys():
+    # 
+        return cash*0.1/(g.ATR[IndexFuture]*future_coef_list[symbol])
+    else:
+        return cash*0.0001/future_coef_list[symbol]
+
+        
+# get current dominant future contract 
+def get_future_code(symbol):
+    future_code_list = {'A':'A8888.XDCE', 'AG':'AG8888.XSGE', 'AL':'AL8888.XSGE', 'AU':'AU8888.XSGE',
+                        'B':'B8888.XDCE', 'BB':'BB8888.XDCE', 'BU':'BU8888.XSGE', 'C':'C8888.XDCE', 
+                        'CF':'CF8888.XZCE', 'CS':'CS8888.XDCE', 'CU':'CU8888.XSGE', 'ER':'ER8888.XZCE', 
+                        'FB':'FB8888.XDCE', 'FG':'FG8888.XZCE', 'FU':'FU8888.XSGE', 'GN':'GN8888.XZCE', 
+                        'HC':'HC8888.XSGE', 'I':'I8888.XDCE', 'IC':'IC8888.CCFX', 'IF':'IF8888.CCFX', 
+                        'IH':'IH8888.CCFX', 'J':'J8888.XDCE', 'JD':'JD8888.XDCE', 'JM':'JM8888.XDCE', 
+                        'JR':'JR8888.XZCE', 'L':'L8888.XDCE', 'LR':'LR8888.XZCE', 'M':'M8888.XDCE', 
+                        'MA':'MA8888.XZCE', 'ME':'ME8888.XZCE', 'NI':'NI8888.XSGE', 'OI':'OI8888.XZCE', 
+                        'P':'P8888.XDCE', 'PB':'PB8888.XSGE', 'PM':'PM8888.XZCE', 'PP':'PP8888.XDCE', 
+                        'RB':'RB8888.XSGE', 'RI':'RI8888.XZCE', 'RM':'RM8888.XZCE', 'RO':'RO8888.XZCE', 
+                        'RS':'RS8888.XZCE', 'RU':'RU8888.XSGE', 'SF':'SF8888.XZCE', 'SM':'SM8888.XZCE', 
+                        'SN':'SN8888.XSGE', 'SR':'SR8888.XZCE', 'T':'T8888.CCFX', 'TA':'TA8888.XZCE', 
+                        'TC':'TC8888.XZCE', 'TF':'TF8888.CCFX', 'V':'V8888.XDCE', 'WH':'WH8888.XZCE', 
+                        'WR':'WR8888.XSGE', 'WS':'WS8888.XZCE', 'WT':'WT8888.XZCE', 'Y':'Y8888.XDCE', 
+                        'ZC':'ZC8888.XZCE', 'ZN':'ZN8888.XSGE'}
+    try:
+        return future_code_list[symbol]
+    except:
+        return 'WARNING: 无此合约'
+
+    
+# Get finance future due time
+def get_CCFX_end_date(future_code):
+    
+    return get_security_info(future_code).end_date
